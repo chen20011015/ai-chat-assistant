@@ -1,7 +1,5 @@
 """
 AI 对话助手 - 基于大模型API的多轮对话工具
-支持：DeepSeek / 智谱GLM / OpenAI 三种API切换
-功能：多轮对话、历史记录、温度调节、对话导出、流式输出、Token用量显示
 """
 
 import streamlit as st
@@ -14,12 +12,16 @@ from datetime import datetime
 def clean_safety_tags(content):
     if not content:
         return content
-    patterns = [r'<ds_safety>.*?</ds_safety>', r'<safety>.*?</safety>',
-                r'<ds_filter>.*?</ds_filter>', r'<filter>.*?</filter>']
-    cleaned = content
-    for p in patterns:
-        cleaned = re.sub(p, '', cleaned, flags=re.DOTALL)
-    return cleaned.strip() if cleaned.strip() else "（AI回复被安全机制过滤，请换个问题试试）"
+    for p in [r'<ds_safety>.*?</ds_safety>', r'<safety>.*?</safety>',
+              r'<ds_filter>.*?</ds_filter>', r'<filter>.*?</filter>']:
+        content = re.sub(p, '', content, flags=re.DOTALL)
+    return content.strip() if content.strip() else "（回复被安全过滤）"
+
+
+def clean_api_key(key):
+    if not key:
+        return key
+    return ''.join(c for c in key if ord(c) < 128).strip()
 
 
 def get_default_key(provider):
@@ -92,16 +94,17 @@ def truncate_messages(messages, max_context_tokens=64000):
 
 
 def call_api(cfg, messages, key, model, temp, max_tok):
+    key = clean_api_key(key)
     try:
         r = requests.post(cfg["url"], headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                           json={"model": model, "messages": messages, "temperature": temp,
                                 "max_tokens": max_tok, "stream": False}, timeout=120)
         if r.status_code == 401:
-            return None, {"error": "❌ API Key 无效（401）"}
+            return None, {"error": "❌ API Key 无效"}
         elif r.status_code == 429:
-            return None, {"error": "❌ 请求过于频繁（429）"}
+            return None, {"error": "❌ 请求过于频繁"}
         elif r.status_code == 402:
-            return None, {"error": "❌ 额度不足（402）"}
+            return None, {"error": "❌ 额度不足"}
         elif r.status_code != 200:
             return None, {"error": f"❌ 错误：{r.status_code}"}
         res = r.json()
@@ -119,6 +122,7 @@ def call_api(cfg, messages, key, model, temp, max_tok):
 
 
 def stream_api(cfg, messages, key, model, temp, max_tok):
+    key = clean_api_key(key)
     data = {"model": model, "messages": messages, "temperature": temp,
             "max_tokens": max_tok, "stream": True}
     if cfg.get("support_stream_options"):
@@ -127,7 +131,7 @@ def stream_api(cfg, messages, key, model, temp, max_tok):
         r = requests.post(cfg["url"], headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                           json=data, timeout=120, stream=True)
         if r.status_code == 401:
-            yield "❌ API Key 无效（401）", None
+            yield "❌ API Key 无效", None
             return
         elif r.status_code != 200:
             yield f"❌ 错误：{r.status_code}", None
