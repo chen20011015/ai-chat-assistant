@@ -1,9 +1,11 @@
-[theme]
-primaryColor = "#1a237e"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f0f0"
-textColor = "#222222"
-font = "sans serif"
+[client]
+# 首屏折叠侧边栏：让访客第一眼看到对话界面，而不是一堆配置项
+initial_sidebar_state = "collapsed"
 
 [server]
-maxUploadSize = 200
+# 与 README 声明保持一致，避免出现"说 20MB 实际 200MB"的矛盾
+maxUploadSize = 20
+
+[theme]
+base = "light"
+primaryColor = "#1A5FB4"
