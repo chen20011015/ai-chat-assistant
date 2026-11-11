@@ -1,287 +1,267 @@
+# -*- coding: utf-8 -*-
 """
-AI 对话助手 - 基于大模型API的多轮对话工具
+AI 对话助手 —— 多模型 API 聚合
+
+支持 DeepSeek / 智谱 GLM / OpenAI 三家，统一走 OpenAI 兼容协议：
+新增厂商只需在 PROVIDERS 里加一条配置，业务代码零改动。
+
+设计要点：
+1. API Key 优先读 Streamlit Secrets，访客无需自备 Key 即可体验
+2. 侧边栏默认折叠，首屏直接是对话界面（配置项是给开发者用的，不该挡住访客）
+3. 流式输出，首字延迟可控
+4. 错误按 Key 无效 / 余额不足 / 网络不通分类提示，不让用户猜
+5. 单会话轮数上限，防止公开 Demo 被刷额度
 """
 
-import streamlit as st
-import requests
 import json
-import re
-from datetime import datetime
+
+import requests
+import streamlit as st
+
+# ============================ 配置 ============================
+
+st.set_page_config(
+    page_title="AI 对话助手",
+    layout="centered",
+    initial_sidebar_state="collapsed",  # 关键：首屏折叠侧栏
+)
+
+PROVIDERS = {
+    "智谱 GLM": {
+        "base": "https://open.bigmodel.cn/api/paas/v4",
+        "models": ["glm-4-flash", "glm-4-air", "glm-4-plus"],
+        "default": "glm-4-flash",
+    },
+    "DeepSeek": {
+        "base": "https://api.deepseek.com/v1",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "default": "deepseek-chat",
+    },
+    "OpenAI": {
+        "base": "https://api.openai.com/v1",
+        "models": ["gpt-4o-mini", "gpt-4o"],
+        "default": "gpt-4o-mini",
+    },
+}
+
+DEFAULT_SYSTEM_PROMPT = "你是一个乐于助人的 AI 助手，回答简洁、准确，中文优先。"
+MAX_ROUNDS = 30  # 单会话最大轮数，防刷
+
+SAMPLES = [
+    "用三句话解释 RAG 是什么",
+    "RAG 和微调，什么时候该选哪个",
+    "怎么降低大模型的幻觉",
+]
 
 
-def clean_safety_tags(content):
-    if not content:
-        return content
-    for p in [r'<ds_safety>.*?</ds_safety>', r'<safety>.*?</safety>',
-              r'<ds_filter>.*?</ds_filter>', r'<filter>.*?</filter>']:
-        content = re.sub(p, '', content, flags=re.DOTALL)
-    return content.strip() if content.strip() else "（回复被安全过滤）"
+# ============================ Key 获取 ============================
 
-
-def clean_api_key(key):
-    if not key:
-        return key
-    return ''.join(c for c in key if ord(c) < 128).strip()
-
-
-def get_default_key(provider):
-    try:
-        s = st.secrets.get("api", {})
-        if provider == "DeepSeek":
-            return s.get("deepseek_key", "")
-        elif provider == "智谱GLM":
-            return s.get("zhipu_key", "")
-        elif provider == "OpenAI":
-            return s.get("openai_key", "")
-    except Exception:
-        pass
+def server_key() -> str:
+    """优先从 Streamlit Secrets 读取管理员配置的 Key。"""
+    for k in ("API_KEY", "DEMO_API_KEY"):
+        try:
+            v = st.secrets.get(k, "")
+            if v:
+                return str(v).strip()
+        except Exception:
+            continue
     return ""
 
 
-st.set_page_config(page_title="AI 对话助手", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+# ============================ 会话状态 ============================
 
-st.markdown("""<style>
-    .footer { font-size:11px; color:#888; text-align:center; margin-top:40px; }
-    .free-badge { background-color:#4caf50; color:white; padding:2px 8px; border-radius:4px; font-size:11px; }
-</style>""", unsafe_allow_html=True)
-
-PROVIDERS = {
-    "智谱GLM": {
-        "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "models": ["glm-4-flash", "glm-4-plus", "glm-4-air"],
-        "default_model": "glm-4-flash",
-        "key_prefix": "",
-        "register_url": "https://open.bigmodel.cn/",
-        "register_hint": "GLM-4-Flash 免费调用",
-        "support_stream_options": False,
-        "max_context_tokens": 128000
-    },
-    "DeepSeek": {
-        "url": "https://api.deepseek.com/v1/chat/completions",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "default_model": "deepseek-chat",
-        "key_prefix": "sk-",
-        "register_url": "https://platform.deepseek.com/",
-        "register_hint": "注册送500万token",
-        "support_stream_options": True,
-        "max_context_tokens": 64000
-    },
-    "OpenAI": {
-        "url": "https://api.openai.com/v1/chat/completions",
-        "models": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
-        "default_model": "gpt-4o-mini",
-        "key_prefix": "sk-",
-        "register_url": "https://platform.openai.com/",
-        "register_hint": "需海外手机号",
-        "support_stream_options": True,
-        "max_context_tokens": 128000
-    }
-}
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "rounds" not in st.session_state:
+    st.session_state.rounds = 0
 
 
-def truncate_messages(messages, max_context_tokens=64000):
-    if not messages:
-        return messages
-    sys = [m for m in messages if m["role"] == "system"]
-    chat = [m for m in messages if m["role"] != "system"]
-    est = sum(len(m["content"]) for m in chat) // 4
-    mx = int(max_context_tokens * 0.8)
-    if est <= mx:
-        return sys + chat
-    while chat and est > mx:
-        est -= len(chat.pop(0)["content"]) // 4
-    return sys + chat
-
-
-def call_api(cfg, messages, key, model, temp, max_tok):
-    key = clean_api_key(key)
-    try:
-        r = requests.post(cfg["url"], headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json={"model": model, "messages": messages, "temperature": temp,
-                                "max_tokens": max_tok, "stream": False}, timeout=120)
-        if r.status_code == 401:
-            return None, {"error": "❌ API Key 无效"}
-        elif r.status_code == 429:
-            return None, {"error": "❌ 请求过于频繁"}
-        elif r.status_code == 402:
-            return None, {"error": "❌ 额度不足"}
-        elif r.status_code != 200:
-            return None, {"error": f"❌ 错误：{r.status_code}"}
-        res = r.json()
-        if "error" in res:
-            return None, {"error": f"❌ {res['error'].get('message', '未知错误')}"}
-        content = clean_safety_tags(res["choices"][0]["message"]["content"])
-        u = res.get("usage", {})
-        return content, {"total_tokens": u.get("total_tokens", 0), "model": model, "status": "ok"}
-    except requests.exceptions.Timeout:
-        return None, {"error": "❌ 请求超时"}
-    except requests.exceptions.ConnectionError:
-        return None, {"error": "❌ 无法连接服务器"}
-    except Exception as e:
-        return None, {"error": f"❌ {str(e)}"}
-
-
-def stream_api(cfg, messages, key, model, temp, max_tok):
-    key = clean_api_key(key)
-    data = {"model": model, "messages": messages, "temperature": temp,
-            "max_tokens": max_tok, "stream": True}
-    if cfg.get("support_stream_options"):
-        data["stream_options"] = {"include_usage": True}
-    try:
-        r = requests.post(cfg["url"], headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                          json=data, timeout=120, stream=True)
-        if r.status_code == 401:
-            yield "❌ API Key 无效", None
-            return
-        elif r.status_code != 200:
-            yield f"❌ 错误：{r.status_code}", None
-            return
-        full = ""
-        usage = None
-        for line in r.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if line.startswith("data: "):
-                line = line[6:]
-            if line == "[DONE]":
-                break
-            try:
-                chunk = json.loads(line)
-                if "usage" in chunk and chunk["usage"]:
-                    usage = chunk["usage"]
-                ch = chunk.get("choices", [])
-                if ch and "content" in ch[0].get("delta", {}):
-                    full += ch[0]["delta"]["content"]
-                    yield clean_safety_tags(full), None
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
-        info = {"model": model, "status": "ok", "stream": True}
-        if usage:
-            info["total_tokens"] = usage.get("total_tokens", 0)
-        yield clean_safety_tags(full), info
-    except Exception as e:
-        yield f"❌ {str(e)}", None
-
-
-defaults = {"messages": [], "api_key": "", "provider": "智谱GLM", "model": "glm-4-flash",
-            "temperature": 0.7, "max_tokens": 2000, "system_prompt": "你是一个有帮助的AI助手。",
-            "debug_mode": False, "stream_mode": True, "total_tokens_used": 0}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ============================ 侧边栏（默认折叠）============================
 
 with st.sidebar:
-    st.header("⚙️ 设置")
-    st.session_state.provider = st.selectbox("选择 API 提供商", list(PROVIDERS.keys()))
-    cfg = PROVIDERS[st.session_state.provider]
-    st.session_state.model = st.selectbox("选择模型", cfg["models"],
-        index=cfg["models"].index(cfg["default_model"]))
-    default_key = get_default_key(st.session_state.provider)
-    current_key = st.session_state.api_key or default_key
-    st.session_state.api_key = st.text_input("API Key", value=current_key, type="password",
-        help="已预配置免费Key，可直接使用")
-    if default_key:
-        st.markdown('<span class="free-badge">✅ 已预配置免费Key</span>', unsafe_allow_html=True)
-    st.markdown(f"📋 [注册获取 Key]({cfg['register_url']})")
-    st.caption(cfg["register_hint"])
+    st.subheader("设置")
+
+    provider_name = st.selectbox("API 提供商", list(PROVIDERS.keys()), index=0)
+    cfg = PROVIDERS[provider_name]
+    model = st.selectbox(
+        "模型",
+        cfg["models"],
+        index=cfg["models"].index(cfg["default"]),
+    )
+
     st.divider()
-    st.subheader("高级参数")
-    st.session_state.temperature = st.slider("Temperature", 0.0, 2.0, st.session_state.temperature, 0.1)
-    st.session_state.max_tokens = st.slider("Max Tokens", 100, 4000, st.session_state.max_tokens, 100)
-    st.session_state.system_prompt = st.text_area("System Prompt", st.session_state.system_prompt, height=80)
-    st.divider()
-    st.subheader("功能")
-    st.session_state.stream_mode = st.checkbox("⚡ 流式输出", st.session_state.stream_mode)
-    st.session_state.debug_mode = st.checkbox("🔧 调试模式", st.session_state.debug_mode)
-    st.divider()
-    if st.session_state.total_tokens_used > 0:
-        st.metric("累计消耗", f"{st.session_state.total_tokens_used:,} tokens")
-    st.divider()
-    if st.button("🗑️ 清空对话", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.total_tokens_used = 0
-        st.rerun()
-    if st.button("📥 导出对话", use_container_width=True) and st.session_state.messages:
-        txt = f"# AI对话记录\n\n提供商：{st.session_state.provider} | 模型：{st.session_state.model}\n\n"
-        for m in st.session_state.messages:
-            txt += f"### {'👤' if m['role']=='user' else '🤖'}\n{m['content']}\n\n---\n\n"
-        st.download_button("下载", txt, f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md", "text/markdown")
 
-st.title("🤖 AI 对话助手")
-st.caption("支持 DeepSeek / 智谱GLM / OpenAI | 打开即用")
+    st.caption("演示模式已内置 Key，可直接对话。如需用自己账号，填在下面覆盖。")
+    user_key = st.text_input("API Key（可选）", type="password", placeholder="留空则使用演示 Key")
 
-if not st.session_state.api_key:
-    st.warning("⚠️ 请在左侧填入 API Key")
-    st.stop()
+    effective_key = user_key.strip() or server_key()
 
-if not st.session_state.messages:
-    st.markdown("<div style='text-align:center; padding:40px; color:#888;'><h3>👋 你好！我是AI对话助手</h3></div>",
-        unsafe_allow_html=True)
-
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(clean_safety_tags(m["content"]))
-        if "usage" in m and m["usage"].get("total_tokens"):
-            st.caption(f"📊 {m['usage']['total_tokens']} tokens")
-
-with st.form("chat_form", clear_on_submit=True):
-    user_input = st.text_area("输入消息", placeholder="在这里输入...", height=100, label_visibility="collapsed")
-    submit = st.form_submit_button("发送", use_container_width=True)
-
-if submit and user_input.strip():
-    st.session_state.messages.append({"role": "user", "content": user_input.strip()})
-    with st.chat_message("user"):
-        st.markdown(user_input.strip())
-    msgs = [{"role": "system", "content": st.session_state.system_prompt}]
-    msgs += [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-    msgs = truncate_messages(msgs, cfg.get("max_context_tokens", 64000))
-
-    if st.session_state.stream_mode:
-        with st.chat_message("assistant"):
-            ph = st.empty()
-            full = ""
-            ui = None
-            for partial, usage in stream_api(cfg, msgs, st.session_state.api_key,
-                st.session_state.model, st.session_state.temperature, st.session_state.max_tokens):
-                full = partial
-                ph.markdown(full + "▌")
-                if usage:
-                    ui = usage
-            ph.markdown(full)
-            if ui and ui.get("total_tokens"):
-                st.caption(f"📊 {ui['total_tokens']} tokens")
-                st.session_state.total_tokens_used += ui["total_tokens"]
-            if st.session_state.debug_mode and ui:
-                with st.expander("🔧 调试"):
-                    st.json(ui)
-            md = {"role": "assistant", "content": full}
-            if ui:
-                md["usage"] = ui
-            st.session_state.messages.append(md)
+    if effective_key:
+        st.success("API 已就绪")
     else:
-        with st.spinner("AI 正在思考..."):
-            resp, ui = call_api(cfg, msgs, st.session_state.api_key,
-                st.session_state.model, st.session_state.temperature, st.session_state.max_tokens)
-        if resp is None:
-            err = ui.get("error", "未知错误") if ui else "未知错误"
-            with st.chat_message("assistant"):
-                st.error(err)
-            st.session_state.messages.append({"role": "assistant", "content": err})
+        st.error("未配置 Key：请在 Secrets 中设置 API_KEY，或在上方填写")
+
+    st.divider()
+
+    st.caption("高级参数")
+    temperature = st.slider("Temperature", 0.0, 1.5, 0.7, 0.1)
+    max_tokens = st.slider("Max Tokens", 256, 4096, 2000, 128)
+    system_prompt = st.text_area("System Prompt", DEFAULT_SYSTEM_PROMPT, height=90)
+
+    st.divider()
+
+    col_a, col_b = st.columns(2)
+    if col_a.button("清空对话", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.rounds = 0
+        st.rerun()
+
+    if st.session_state.messages:
+        md = "\n\n".join(
+            f"**{'你' if m['role'] == 'user' else 'AI'}**：{m['content']}"
+            for m in st.session_state.messages
+        )
+        col_b.download_button(
+            "导出记录",
+            data=md.encode("utf-8"),
+            file_name="chat.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.caption(
+        "技术栈：Python · Streamlit · requests\n\n"
+        "[查看源码](https://github.com/chen20011015/ai-chat-assistant)"
+    )
+
+
+# ============================ 流式调用 ============================
+
+class ApiError(Exception):
+    """业务可读的 API 错误。"""
+
+
+def stream_chat(base, key, model, messages, temperature, max_tokens):
+    """统一 OpenAI 兼容协议的流式调用，逐块 yield 文本。"""
+    url = f"{base.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    try:
+        resp = requests.post(
+            url, headers=headers, json=payload, stream=True, timeout=(10, 120)
+        )
+    except requests.exceptions.ConnectTimeout:
+        raise ApiError("连接超时：检查网络或代理设置")
+    except requests.exceptions.ConnectionError:
+        raise ApiError("网络不通：无法连接到 API 服务器")
+    except requests.exceptions.RequestException as e:
+        raise ApiError(f"请求失败：{e}")
+
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            detail = resp.text[:200]
+        if resp.status_code in (401, 403):
+            raise ApiError(f"Key 无效或无权限（{resp.status_code}）：{detail}")
+        if resp.status_code == 429:
+            raise ApiError(f"触发限流或余额不足（429）：{detail}")
+        if resp.status_code >= 500:
+            raise ApiError(f"服务端异常（{resp.status_code}）：{detail}")
+        raise ApiError(f"请求被拒绝（{resp.status_code}）：{detail}")
+
+    for raw in resp.iter_lines(decode_unicode=True):
+        if not raw or not raw.startswith("data:"):
+            continue
+        chunk = raw[5:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            obj = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        choices = obj.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        piece = delta.get("content")
+        if piece:
+            yield piece
+
+
+# ============================ 页面主体 ============================
+
+st.title("AI 对话助手")
+st.caption("DeepSeek / 智谱 GLM / OpenAI 一键切换 · 流式输出 · 无需自备 Key")
+
+# 历史消息
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# 空态：给三个示例问题，降低冷启动门槛
+if not st.session_state.messages:
+    st.write("")
+    st.markdown("**试试这些**")
+    cols = st.columns(3)
+    for col, q in zip(cols, SAMPLES):
+        if col.button(q, use_container_width=True, key=f"sample_{q}"):
+            st.session_state.messages.append({"role": "user", "content": q})
+            st.rerun()
+
+# 输入框
+prompt = st.chat_input("在这里输入…")
+if prompt:
+    if st.session_state.rounds >= MAX_ROUNDS:
+        st.warning(f"演示额度已用完（{MAX_ROUNDS} 轮），请刷新页面或填写自己的 API Key。")
+    else:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.rerun()
+
+# 若最后一条是用户消息，则生成回复
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    with st.chat_message("assistant"):
+        if not effective_key:
+            st.error("未配置 API Key，无法生成回复。")
         else:
-            with st.chat_message("assistant"):
-                st.markdown(resp)
-                if ui and ui.get("total_tokens"):
-                    st.caption(f"📊 {ui['total_tokens']} tokens")
-                    st.session_state.total_tokens_used += ui["total_tokens"]
-                if st.session_state.debug_mode and ui:
-                    with st.expander("🔧 调试"):
-                        st.json(ui)
-            md = {"role": "assistant", "content": resp}
-            if ui:
-                md["usage"] = ui
-            st.session_state.messages.append(md)
-    st.rerun()
+            api_messages = [{"role": "system", "content": system_prompt}]
+            api_messages.extend(st.session_state.messages)
+
+            try:
+                reply = st.write_stream(
+                    stream_chat(
+                        cfg["base"],
+                        effective_key,
+                        model,
+                        api_messages,
+                        temperature,
+                        max_tokens,
+                    )
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": reply}
+                )
+                st.session_state.rounds += 1
+            except ApiError as e:
+                st.error(str(e))
+                # 出错时回滚这条用户消息，避免历史里留空回复
+                st.session_state.messages.pop()
+            except Exception as e:  # 兜底，避免整页崩掉
+                st.error(f"未预期的错误：{type(e).__name__}: {e}")
+                st.session_state.messages.pop()
+
 
 st.divider()
 st.markdown('<div class="footer">🔧 Python + Streamlit + 大模型API</div>', unsafe_allow_html=True)
